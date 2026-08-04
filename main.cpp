@@ -38,30 +38,17 @@ static bool file_exists(const string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
-static void do_insert(const string& index, int value) {
-    int b = get_bucket(index);
-    string path = bucket_path(b);
-
-    // Append new entry (input guarantees no duplicate index,value pairs)
-    ofstream out(path, ios::binary | ios::app);
-    uint8_t len = static_cast<uint8_t>(index.size());
-    out.write(reinterpret_cast<const char*>(&len), 1);
-    out.write(index.c_str(), len);
-    out.write(reinterpret_cast<const char*>(&value), 4);
-}
-
-static void do_delete(const string& index, int value) {
-    int b = get_bucket(index);
-    string path = bucket_path(b);
-
-    if (!file_exists(path)) return;
-
+// Compact a bucket file: remove all deleted entries
+static void compact_bucket(const string& path) {
     string tmp_path = path + ".tmp";
-
     ifstream in(path, ios::binary);
     ofstream out(tmp_path, ios::binary);
 
-    while (in) {
+    while (true) {
+        uint8_t flags;
+        in.read(reinterpret_cast<char*>(&flags), 1);
+        if (!in) break;
+
         uint8_t len;
         in.read(reinterpret_cast<char*>(&len), 1);
         if (!in) break;
@@ -74,19 +61,84 @@ static void do_delete(const string& index, int value) {
         in.read(reinterpret_cast<char*>(&val), 4);
         if (!in) break;
 
-        if (idx == index && val == value) {
-            continue; // skip deleted entry
+        if (flags == 0) {
+            out.write(reinterpret_cast<const char*>(&flags), 1);
+            out.write(reinterpret_cast<const char*>(&len), 1);
+            out.write(idx.c_str(), len);
+            out.write(reinterpret_cast<const char*>(&val), 4);
         }
-
-        out.write(reinterpret_cast<const char*>(&len), 1);
-        out.write(idx.c_str(), len);
-        out.write(reinterpret_cast<const char*>(&val), 4);
     }
-
     in.close();
     out.close();
-
     rename(tmp_path.c_str(), path.c_str());
+}
+
+static void do_insert(const string& index, int value) {
+    int b = get_bucket(index);
+    string path = bucket_path(b);
+
+    // Append new entry
+    ofstream out(path, ios::binary | ios::app);
+    uint8_t flags = 0; // active
+    uint8_t len = static_cast<uint8_t>(index.size());
+    out.write(reinterpret_cast<const char*>(&flags), 1);
+    out.write(reinterpret_cast<const char*>(&len), 1);
+    out.write(index.c_str(), len);
+    out.write(reinterpret_cast<const char*>(&value), 4);
+}
+
+static void do_delete(const string& index, int value) {
+    int b = get_bucket(index);
+    string path = bucket_path(b);
+
+    if (!file_exists(path)) return;
+
+    // Open in read-write mode
+    fstream fs(path, ios::in | ios::out | ios::binary);
+    if (!fs) return;
+
+    int total = 0, deleted = 0;
+    bool compact_needed = false;
+
+    while (true) {
+        streampos pos = fs.tellg();
+        uint8_t flags;
+        fs.read(reinterpret_cast<char*>(&flags), 1);
+        if (!fs) break;
+
+        uint8_t len;
+        fs.read(reinterpret_cast<char*>(&len), 1);
+        if (!fs) break;
+
+        string idx(len, '\0');
+        fs.read(&idx[0], len);
+        if (!fs) break;
+
+        int val;
+        fs.read(reinterpret_cast<char*>(&val), 4);
+        if (!fs) break;
+
+        total++;
+        if (flags == 1) {
+            deleted++;
+            continue;
+        }
+
+        if (idx == index && val == value) {
+            // Mark as deleted by flipping the flags byte
+            fs.seekp(pos);
+            uint8_t del_flag = 1;
+            fs.write(reinterpret_cast<const char*>(&del_flag), 1);
+            fs.seekp(0, ios::end); // restore write position
+            deleted++;
+        }
+    }
+    fs.close();
+
+    // Compact if more than half are deleted
+    if (total > 0 && deleted * 2 >= total) {
+        compact_bucket(path);
+    }
 }
 
 static void do_find(const string& index) {
@@ -97,7 +149,11 @@ static void do_find(const string& index) {
 
     if (file_exists(path)) {
         ifstream in(path, ios::binary);
-        while (in) {
+        while (true) {
+            uint8_t flags;
+            in.read(reinterpret_cast<char*>(&flags), 1);
+            if (!in) break;
+
             uint8_t len;
             in.read(reinterpret_cast<char*>(&len), 1);
             if (!in) break;
@@ -110,7 +166,7 @@ static void do_find(const string& index) {
             in.read(reinterpret_cast<char*>(&val), 4);
             if (!in) break;
 
-            if (idx == index) {
+            if (flags == 0 && idx == index) {
                 values.push_back(val);
             }
         }

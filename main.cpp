@@ -42,27 +42,23 @@ static int cmp_index(const char a[INDEX_SIZE], const char b[INDEX_SIZE]) {
     return memcmp(a, b, INDEX_SIZE);
 }
 
-// Compare two records by (index, value)
 static bool record_less(const Record& a, const Record& b) {
     int c = cmp_index(a.index, b.index);
     if (c != 0) return c < 0;
     return a.value < b.value;
 }
 
-// Read a specific record from sorted file by index
 static bool read_sorted_record(FILE* f, int idx, Record& r) {
     if (fseek(f, (long)idx * RECORD_SIZE, SEEK_SET) != 0) return false;
     return fread(&r, RECORD_SIZE, 1, f) == 1;
 }
 
-// Get number of records in sorted file
 static int sorted_count(FILE* f) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     return (int)(size / RECORD_SIZE);
 }
 
-// Binary search in sorted file
 static int binary_search_sorted(FILE* f, const char target[INDEX_SIZE], int count) {
     if (count == 0) return -1;
     int lo = 0, hi = count - 1;
@@ -84,7 +80,6 @@ static int binary_search_sorted(FILE* f, const char target[INDEX_SIZE], int coun
     return found;
 }
 
-// Streaming merge: log into sorted file, without loading everything in memory
 static void merge() {
     string lp = log_path();
     if (!file_exists(lp)) return;
@@ -105,16 +100,38 @@ static void merge() {
         }
     }
 
-    // Separate into inserts and deletes
-    vector<Record> inserts, deletions;
-    for (auto& r : log_recs) {
-        if (r.flag == 0) inserts.push_back(r);
-        else deletions.push_back(r);
-    }
-    sort(inserts.begin(), inserts.end(), record_less);
-    sort(deletions.begin(), deletions.end(), record_less);
+    // Process log chronologically: build net insertions and removals
+    vector<Record> inserts;
+    vector<Record> removals;
 
-    // Open sorted for streaming read
+    for (const auto& lr : log_recs) {
+        if (lr.flag == 0) {
+            // Insert: cancel any matching removal, then add
+            for (auto it = removals.begin(); it != removals.end(); ++it) {
+                if (cmp_index(it->index, lr.index) == 0 && it->value == lr.value) {
+                    removals.erase(it);
+                    break;
+                }
+            }
+            inserts.push_back(lr);
+        } else {
+            // Delete: remove from inserts if present, else add to removals
+            bool found = false;
+            for (auto it = inserts.begin(); it != inserts.end(); ++it) {
+                if (cmp_index(it->index, lr.index) == 0 && it->value == lr.value) {
+                    inserts.erase(it);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) removals.push_back(lr);
+        }
+    }
+
+    sort(inserts.begin(), inserts.end(), record_less);
+    sort(removals.begin(), removals.end(), record_less);
+
+    // Stream sorted file and merge with inserts, skipping removals
     ifstream sin;
     bool has_sorted = false;
     Record sorted_r;
@@ -124,11 +141,10 @@ static void merge() {
         has_sorted = sin.good();
     }
 
-    // Open temp for output
     ofstream tout(tmp_path(), ios::binary | ios::trunc);
     if (!tout) { sin.close(); return; }
 
-    size_t di = 0, ii = 0;
+    size_t ri = 0, ii = 0;
 
     while (has_sorted || ii < inserts.size()) {
         bool take_sorted;
@@ -141,34 +157,23 @@ static void merge() {
         } else if (record_less(inserts[ii], sorted_r)) {
             take_sorted = false;
         } else {
-            // Equal records: sorted_r == inserts[ii]
-            // Check deletion first, then decide which to keep
-            bool sorted_is_deleted = false;
-            while (di < deletions.size()) {
-                if (record_less(deletions[di], sorted_r)) {
-                    di++;
-                    continue;
-                }
-                if (record_less(sorted_r, deletions[di])) {
-                    break;
-                }
-                sorted_is_deleted = true;
-                di++;
-                break;
+            // Equal: sorted_r == inserts[ii]
+            // Check if sorted_r should be removed
+            bool sorted_is_removed = false;
+            while (ri < removals.size()) {
+                if (record_less(removals[ri], sorted_r)) { ri++; continue; }
+                if (record_less(sorted_r, removals[ri])) break;
+                sorted_is_removed = true; ri++; break;
             }
 
-            if (sorted_is_deleted) {
-                // Sorted entry is deleted, take the insert instead
-                Record r = inserts[ii];
-                r.flag = 0;
-                tout.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
+            if (sorted_is_removed) {
+                // Take the insert instead of the removed sorted entry
+                tout.write(reinterpret_cast<const char*>(&inserts[ii]), RECORD_SIZE);
             } else {
-                // Not deleted, keep sorted (skip duplicate insert)
-                sorted_r.flag = 0;
+                // Keep sorted, skip duplicate insert
                 tout.write(reinterpret_cast<const char*>(&sorted_r), RECORD_SIZE);
             }
 
-            // Advance both
             sin.read(reinterpret_cast<char*>(&sorted_r), RECORD_SIZE);
             has_sorted = sin.good();
             ii++;
@@ -176,44 +181,28 @@ static void merge() {
         }
 
         if (take_sorted) {
-            // Check if sorted_r should be deleted
-            bool deleted = false;
-            while (di < deletions.size()) {
-                if (record_less(deletions[di], sorted_r)) {
-                    di++;
-                    continue;
-                }
-                if (record_less(sorted_r, deletions[di])) {
-                    break;
-                }
-                // Equal: mark as deleted
-                deleted = true;
-                di++;
-                break;
+            // Check if sorted_r should be removed
+            bool removed = false;
+            while (ri < removals.size()) {
+                if (record_less(removals[ri], sorted_r)) { ri++; continue; }
+                if (record_less(sorted_r, removals[ri])) break;
+                removed = true; ri++; break;
             }
-
-            if (!deleted) {
-                sorted_r.flag = 0;
+            if (!removed) {
                 tout.write(reinterpret_cast<const char*>(&sorted_r), RECORD_SIZE);
             }
-
-            // Read next sorted
             sin.read(reinterpret_cast<char*>(&sorted_r), RECORD_SIZE);
             has_sorted = sin.good();
         } else {
-            Record r = inserts[ii];
-            r.flag = 0;
-            tout.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
+            tout.write(reinterpret_cast<const char*>(&inserts[ii]), RECORD_SIZE);
             ii++;
         }
     }
 
     sin.close();
     tout.close();
-
     rename(tmp_path().c_str(), sp.c_str());
 
-    // Truncate log
     ofstream lclear(lp, ios::binary | ios::trunc);
     lclear.close();
 }
@@ -223,10 +212,8 @@ static void do_insert(const string& index, int value) {
     pad_index(index, r.index);
     r.value = value;
     r.flag = 0;
-
     ofstream out(log_path(), ios::binary | ios::app);
     out.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
-    out.close();
 }
 
 static void do_delete(const string& index, int value) {
@@ -234,10 +221,8 @@ static void do_delete(const string& index, int value) {
     pad_index(index, r.index);
     r.value = value;
     r.flag = 1;
-
     ofstream out(log_path(), ios::binary | ios::app);
     out.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
-    out.close();
 }
 
 static void do_find(const string& index) {
@@ -246,7 +231,6 @@ static void do_find(const string& index) {
 
     vector<int> values;
 
-    // Binary search sorted file
     string sp = sorted_path();
     FILE* f = fopen(sp.c_str(), "rb");
     if (f) {
@@ -263,7 +247,6 @@ static void do_find(const string& index) {
         fclose(f);
     }
 
-    // Apply log operations
     string lp = log_path();
     if (file_exists(lp)) {
         ifstream in(lp, ios::binary);
@@ -324,9 +307,7 @@ int main() {
             do_find(index);
         }
 
-        if (i % 500 == 499) {
-            merge();
-        }
+        if (i % 500 == 499) merge();
     }
 
     merge();

@@ -141,8 +141,34 @@ static void merge() {
         } else if (record_less(inserts[ii], sorted_r)) {
             take_sorted = false;
         } else {
-            // Equal records - skip the insert (keep sorted or discard both)
-            // Advance both to avoid duplicates
+            // Equal records: sorted_r == inserts[ii]
+            // Check deletion first, then decide which to keep
+            bool sorted_is_deleted = false;
+            while (di < deletions.size()) {
+                if (record_less(deletions[di], sorted_r)) {
+                    di++;
+                    continue;
+                }
+                if (record_less(sorted_r, deletions[di])) {
+                    break;
+                }
+                sorted_is_deleted = true;
+                di++;
+                break;
+            }
+
+            if (sorted_is_deleted) {
+                // Sorted entry is deleted, take the insert instead
+                Record r = inserts[ii];
+                r.flag = 0;
+                tout.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
+            } else {
+                // Not deleted, keep sorted (skip duplicate insert)
+                sorted_r.flag = 0;
+                tout.write(reinterpret_cast<const char*>(&sorted_r), RECORD_SIZE);
+            }
+
+            // Advance both
             sin.read(reinterpret_cast<char*>(&sorted_r), RECORD_SIZE);
             has_sorted = sin.good();
             ii++;

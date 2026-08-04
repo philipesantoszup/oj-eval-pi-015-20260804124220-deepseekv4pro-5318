@@ -15,7 +15,7 @@ const string DATA_DIR = "./data/";
 const int INDEX_SIZE = 64;      // padded index length
 const int RECORD_SIZE = INDEX_SIZE + 4 + 1; // index(64) + value(4) + flag(1) = 69
 
-struct Record {
+struct __attribute__((packed)) Record {
     char index[INDEX_SIZE];
     int32_t value;
     uint8_t flag; // 0=active, 1=deleted (tombstone in log)
@@ -96,7 +96,7 @@ static void read_log(vector<Record>& out) {
     }
 }
 
-// Merge log into sorted file
+// Merge log into sorted file - simplified, correct version
 static void merge() {
     string lp = log_path();
     if (!file_exists(lp)) return;
@@ -104,83 +104,49 @@ static void merge() {
     // Check if log is large enough to justify merge
     struct stat st;
     if (stat(lp.c_str(), &st) != 0) return;
-    if (st.st_size < 50 * 1024) return; // only merge when log > 50KB
+    if (st.st_size < 20 * 1024) return; // only merge when log > 20KB
 
     string sp = sorted_path();
 
-    // Read log records
-    vector<Record> log_recs;
-    read_log(log_recs);
-
-    // Separate log into deletions and insertions
-    vector<Record> inserts;
-    vector<Record> deletions;
-    for (const auto& r : log_recs) {
-        if (r.flag == 0) inserts.push_back(r);
-        else deletions.push_back(r);
-    }
-
-    // Sort deletions and inserts by (index, value)
-    sort(deletions.begin(), deletions.end(), record_less);
-    sort(inserts.begin(), inserts.end(), record_less);
-
-    // Open sorted file for streaming
-    ifstream sin(sp, ios::binary);
-    bool have_sorted = sin.is_open();
-    Record sorted_r;
-    sin.read(reinterpret_cast<char*>(&sorted_r), RECORD_SIZE);
-    bool sorted_valid = have_sorted && sin.good();
-
-    // Open temp file for output
-    ofstream tout(tmp_path(), ios::binary | ios::trunc);
-    if (!tout) { sin.close(); return; }
-
-    // Merge: sorted entries (skip deleted) + inserts
-    size_t di = 0, ii = 0;
-
-    while (sorted_valid || ii < inserts.size()) {
-        bool take_sorted = false;
-        if (!sorted_valid) {
-            take_sorted = false;
-        } else if (ii >= inserts.size()) {
-            take_sorted = true;
-        } else {
-            take_sorted = record_less(sorted_r, inserts[ii]);
-        }
-
-        if (take_sorted) {
-            // Check if this record should be deleted
-            bool deleted = false;
-            while (di < deletions.size()) {
-                int c = cmp_index(deletions[di].index, sorted_r.index);
-                if (c < 0) { di++; continue; }
-                if (c > 0) break;
-                if (deletions[di].value == sorted_r.value) { deleted = true; di++; break; }
-                if (deletions[di].value < sorted_r.value) { di++; continue; }
-                break;
-            }
-
-            if (!deleted) {
-                sorted_r.flag = 0;
-                tout.write(reinterpret_cast<const char*>(&sorted_r), RECORD_SIZE);
-            }
-
-            // Read next sorted record
-            sin.read(reinterpret_cast<char*>(&sorted_r), RECORD_SIZE);
-            sorted_valid = sin.good();
-        } else {
-            Record r = inserts[ii];
-            r.flag = 0;
-            tout.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
-            ii++;
+    // Read all sorted records
+    vector<Record> all;
+    if (file_exists(sp)) {
+        ifstream sin(sp, ios::binary);
+        Record r;
+        while (sin.read(reinterpret_cast<char*>(&r), RECORD_SIZE)) {
+            all.push_back(r);
         }
     }
 
-    sin.close();
-    tout.close();
+    // Read log records and apply them
+    ifstream lin(lp, ios::binary);
+    Record lr;
+    while (lin.read(reinterpret_cast<char*>(&lr), RECORD_SIZE)) {
+        if (lr.flag == 0) {
+            // Insert: add to all (no duplicate check needed, input guarantees)
+            all.push_back(lr);
+        } else {
+            // Delete: find and remove
+            for (auto it = all.begin(); it != all.end(); ++it) {
+                if (cmp_index(it->index, lr.index) == 0 && it->value == lr.value) {
+                    all.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+    lin.close();
 
-    // Replace sorted file with temp file
-    rename(tmp_path().c_str(), sp.c_str());
+    // Sort all records
+    sort(all.begin(), all.end(), record_less);
+
+    // Write to sorted file
+    ofstream sout(sp, ios::binary | ios::trunc);
+    for (auto& r : all) r.flag = 0;
+    if (!all.empty()) {
+        sout.write(reinterpret_cast<const char*>(all.data()), all.size() * RECORD_SIZE);
+    }
+    sout.close();
 
     // Truncate log file
     ofstream lclear(lp, ios::binary | ios::trunc);

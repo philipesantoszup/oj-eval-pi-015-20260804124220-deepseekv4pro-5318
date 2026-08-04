@@ -11,8 +11,19 @@
 
 using namespace std;
 
-const int NUM_BUCKETS = 19;
+const int NUM_BUCKETS = 9;
 const string DATA_DIR = "./data/";
+const int INDEX_SIZE = 64;      // padded index length
+const int VAL_SIZE = 4;         // int32 value
+const int FLAG_SIZE = 1;        // 0=insert(add), 1=delete(tombstone)
+const int RECORD_SIZE = INDEX_SIZE + VAL_SIZE + FLAG_SIZE; // 69 bytes
+const size_t LOG_MERGE_THRESHOLD = 50 * 1024; // merge log when > 50KB
+
+struct Record {
+    char index[INDEX_SIZE];
+    int value;
+    uint8_t flag; // 0 for insert/add, 1 for delete/tombstone
+};
 
 // DJB2 hash
 static uint32_t hash_str(const string& s) {
@@ -25,8 +36,12 @@ static int get_bucket(const string& s) {
     return hash_str(s) % NUM_BUCKETS;
 }
 
-static string bucket_path(int b) {
-    return DATA_DIR + to_string(b) + ".dat";
+static string sorted_path(int b) {
+    return DATA_DIR + to_string(b) + "_s.dat";
+}
+
+static string log_path(int b) {
+    return DATA_DIR + to_string(b) + "_l.dat";
 }
 
 static void ensure_dir() {
@@ -38,144 +53,192 @@ static bool file_exists(const string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
-// Compact a bucket file: remove all deleted entries
-static void compact_bucket(const string& path) {
-    string tmp_path = path + ".tmp";
-    ifstream in(path, ios::binary);
-    ofstream out(tmp_path, ios::binary);
-
-    while (true) {
-        uint8_t flags;
-        in.read(reinterpret_cast<char*>(&flags), 1);
-        if (!in) break;
-
-        uint8_t len;
-        in.read(reinterpret_cast<char*>(&len), 1);
-        if (!in) break;
-
-        string idx(len, '\0');
-        in.read(&idx[0], len);
-        if (!in) break;
-
-        int val;
-        in.read(reinterpret_cast<char*>(&val), 4);
-        if (!in) break;
-
-        if (flags == 0) {
-            out.write(reinterpret_cast<const char*>(&flags), 1);
-            out.write(reinterpret_cast<const char*>(&len), 1);
-            out.write(idx.c_str(), len);
-            out.write(reinterpret_cast<const char*>(&val), 4);
-        }
-    }
-    in.close();
-    out.close();
-    rename(tmp_path.c_str(), path.c_str());
+static void pad_index(const string& src, char dst[INDEX_SIZE]) {
+    size_t len = min(src.size(), (size_t)INDEX_SIZE);
+    memcpy(dst, src.c_str(), len);
+    if (len < INDEX_SIZE) memset(dst + len, 0, INDEX_SIZE - len);
 }
 
-static void do_insert(const string& index, int value) {
-    int b = get_bucket(index);
-    string path = bucket_path(b);
-
-    // Append new entry
-    ofstream out(path, ios::binary | ios::app);
-    uint8_t flags = 0; // active
-    uint8_t len = static_cast<uint8_t>(index.size());
-    out.write(reinterpret_cast<const char*>(&flags), 1);
-    out.write(reinterpret_cast<const char*>(&len), 1);
-    out.write(index.c_str(), len);
-    out.write(reinterpret_cast<const char*>(&value), 4);
-}
-
-static void do_delete(const string& index, int value) {
-    int b = get_bucket(index);
-    string path = bucket_path(b);
-
+// Read all records from a file into vector
+static void read_records(const string& path, vector<Record>& out) {
     if (!file_exists(path)) return;
-
-    // Open in read-write mode
-    fstream fs(path, ios::in | ios::out | ios::binary);
-    if (!fs) return;
-
-    int total = 0, deleted = 0;
-    bool compact_needed = false;
-
-    while (true) {
-        streampos pos = fs.tellg();
-        uint8_t flags;
-        fs.read(reinterpret_cast<char*>(&flags), 1);
-        if (!fs) break;
-
-        uint8_t len;
-        fs.read(reinterpret_cast<char*>(&len), 1);
-        if (!fs) break;
-
-        string idx(len, '\0');
-        fs.read(&idx[0], len);
-        if (!fs) break;
-
-        int val;
-        fs.read(reinterpret_cast<char*>(&val), 4);
-        if (!fs) break;
-
-        total++;
-        if (flags == 1) {
-            deleted++;
-            continue;
-        }
-
-        if (idx == index && val == value) {
-            // Mark as deleted by flipping the flags byte
-            fs.seekp(pos);
-            uint8_t del_flag = 1;
-            fs.write(reinterpret_cast<const char*>(&del_flag), 1);
-            fs.seekp(0, ios::end); // restore write position
-            deleted++;
-        }
-    }
-    fs.close();
-
-    // Compact if more than half are deleted
-    if (total > 0 && deleted * 2 >= total) {
-        compact_bucket(path);
+    ifstream in(path, ios::binary);
+    Record r;
+    while (in.read(reinterpret_cast<char*>(&r), RECORD_SIZE)) {
+        out.push_back(r);
     }
 }
 
-static void do_find(const string& index) {
-    int b = get_bucket(index);
-    string path = bucket_path(b);
+// Write all records to a file
+static void write_records(const string& path, const vector<Record>& recs) {
+    ofstream out(path, ios::binary | ios::trunc);
+    out.write(reinterpret_cast<const char*>(recs.data()), recs.size() * RECORD_SIZE);
+}
 
-    vector<int> values;
+// Compare two padded indices
+static int cmp_index(const char a[INDEX_SIZE], const char b[INDEX_SIZE]) {
+    return memcmp(a, b, INDEX_SIZE);
+}
 
-    if (file_exists(path)) {
-        ifstream in(path, ios::binary);
-        while (true) {
-            uint8_t flags;
-            in.read(reinterpret_cast<char*>(&flags), 1);
-            if (!in) break;
+// Find records in sorted vector matching target index
+static void find_in_sorted(const vector<Record>& sorted, const char target[INDEX_SIZE],
+                           vector<int>& values) {
+    if (sorted.empty()) return;
 
-            uint8_t len;
-            in.read(reinterpret_cast<char*>(&len), 1);
-            if (!in) break;
+    // Binary search for first occurrence
+    auto it = lower_bound(sorted.begin(), sorted.end(), target,
+        [](const Record& r, const char t[INDEX_SIZE]) {
+            return cmp_index(r.index, t) < 0;
+        });
 
-            string idx(len, '\0');
-            in.read(&idx[0], len);
-            if (!in) break;
+    while (it != sorted.end() && cmp_index(it->index, target) == 0) {
+        values.push_back(it->value);
+        ++it;
+    }
+}
 
-            int val;
-            in.read(reinterpret_cast<char*>(&val), 4);
-            if (!in) break;
+// Apply log operations to a value set
+static void apply_log(const vector<Record>& log, const char target[INDEX_SIZE],
+                      vector<int>& values) {
+    for (const auto& r : log) {
+        if (cmp_index(r.index, target) != 0) continue;
+        if (r.flag == 0) {
+            // Insert: add value (assume no duplicate)
+            values.push_back(r.value);
+        } else {
+            // Delete: remove value
+            auto it = find(values.begin(), values.end(), r.value);
+            if (it != values.end()) values.erase(it);
+        }
+    }
+}
 
-            if (flags == 0 && idx == index) {
-                values.push_back(val);
+// Merge log into sorted file for a bucket
+static void merge_bucket(int b) {
+    string sp = sorted_path(b);
+    string lp = log_path(b);
+
+    if (!file_exists(lp)) return;
+    // Check log size
+    struct stat st;
+    if (stat(lp.c_str(), &st) != 0) return;
+    if ((size_t)st.st_size <= LOG_MERGE_THRESHOLD) return;
+
+    vector<Record> sorted_recs;
+    vector<Record> log_recs;
+
+    read_records(sp, sorted_recs);
+    read_records(lp, log_recs);
+
+    // Build a map of existing entries (index,value) from sorted
+    // Then apply log operations
+    // We'll use a vector and sort after applying
+
+    // Convert sorted to a set for easy lookup/deletion
+    // Key: padded index (64 bytes) + value (4 bytes) = 68 bytes
+    // We'll use a map<string, int> - no, too much memory.
+
+    // Instead, process entries sequentially:
+    // 1. Collect all entries from sorted as (index_padded, value) pairs
+    // 2. Apply log: for each insert, add pair; for each delete, remove pair
+    // 3. Sort all remaining pairs
+    // 4. Write back
+
+    // For simplicity, use a vector<Record> and process
+    vector<Record> all = sorted_recs;
+
+    for (const auto& lr : log_recs) {
+        if (lr.flag == 0) {
+            // Insert
+            all.push_back(lr);
+            all.back().flag = 0;
+        } else {
+            // Delete: find and remove
+            for (auto it = all.begin(); it != all.end(); ++it) {
+                if (cmp_index(it->index, lr.index) == 0 && it->value == lr.value) {
+                    all.erase(it);
+                    break;
+                }
             }
         }
     }
 
+    // Sort all by (index, value)
+    sort(all.begin(), all.end(), [](const Record& a, const Record& b) {
+        int c = cmp_index(a.index, b.index);
+        if (c != 0) return c < 0;
+        return a.value < b.value;
+    });
+
+    // Write back to sorted file
+    write_records(sp, all);
+
+    // Truncate log file
+    ofstream trunc(lp, ios::binary | ios::trunc);
+    trunc.close();
+}
+
+static void do_insert(const string& index, int value) {
+    int b = get_bucket(index);
+    string lp = log_path(b);
+
+    Record r;
+    pad_index(index, r.index);
+    r.value = value;
+    r.flag = 0;
+
+    ofstream out(lp, ios::binary | ios::app);
+    out.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
+    out.close();
+
+    // Check if we should merge
+    merge_bucket(b);
+}
+
+static void do_delete(const string& index, int value) {
+    int b = get_bucket(index);
+    string lp = log_path(b);
+
+    Record r;
+    pad_index(index, r.index);
+    r.value = value;
+    r.flag = 1;
+
+    ofstream out(lp, ios::binary | ios::app);
+    out.write(reinterpret_cast<const char*>(&r), RECORD_SIZE);
+    out.close();
+
+    // Check if we should merge
+    merge_bucket(b);
+}
+
+static void do_find(const string& index) {
+    char target[INDEX_SIZE];
+    pad_index(index, target);
+
+    int b = get_bucket(index);
+
+    // Read sorted file
+    vector<Record> sorted_recs;
+    read_records(sorted_path(b), sorted_recs);
+
+    // Read log file
+    vector<Record> log_recs;
+    read_records(log_path(b), log_recs);
+
+    // Get values from sorted
+    vector<int> values;
+    find_in_sorted(sorted_recs, target, values);
+
+    // Apply log operations
+    apply_log(log_recs, target, values);
+
+    // Sort and deduplicate (in case of re-insert)
+    sort(values.begin(), values.end());
+
     if (values.empty()) {
         cout << "null\n";
     } else {
-        sort(values.begin(), values.end());
         for (size_t i = 0; i < values.size(); ++i) {
             if (i > 0) cout << ' ';
             cout << values[i];
